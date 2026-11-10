@@ -102,7 +102,10 @@ jobs:
             $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++11> $<$<COMPILE_LANGUAGE:OBJCXX>:-std=gnu++11>
             # Original Win32 semantics: 32-bit 'long' case labels / char tables with values > LONG_MAX / CHAR_MAX wrap.
             # C++11 makes these hard narrowing errors (e.g. INIT.CPP PARM_* case labels on ILP32).
-            $<$<COMPILE_LANGUAGE:CXX>:-Wno-c++11-narrowing>)
+            $<$<COMPILE_LANGUAGE:CXX>:-Wno-c++11-narrowing>
+            # The game does not use C++ exceptions, and the Theos LLVM 19 ARM backend segfaults emitting EH tables
+            # for armv7 (EHStreamer::computeCallSiteTable) on INIT.CPP / SAVELOAD.CPP.
+            $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions> $<$<COMPILE_LANGUAGE:OBJCXX>:-fno-exceptions>)
           set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/host/ios_diag.mm" PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
           target_include_directories(CommandConquer PRIVATE "${SDL_DIR}/include" "${SDL_DIR}/include/SDL2")
 
@@ -421,19 +424,15 @@ jobs:
           	raise(sig);
           }
 
+          // No try/catch here on purpose: the Theos LLVM 19 backend crashes while emitting armv7 EH tables
+          // (EHStreamer::computeCallSiteTable), so the whole target is built with -fno-exceptions.
           static void TerminateHandler(void)
           {
           	static int busy = 0;
           	if (!busy) {
           		busy = 1;
-          		char b[600];
-          		try { throw; }
-          		catch (const std::exception &e) { snprintf(b, sizeof(b), "std::exception: %s", e.what()); }
-          		catch (const char *s) { snprintf(b, sizeof(b), "thrown const char*: %s", s ? s : "(null)"); }
-          		catch (int i) { snprintf(b, sizeof(b), "thrown int: %d", i); }
-          		catch (...) { snprintf(b, sizeof(b), "unknown exception"); }
-          		char m[800];
-          		snprintf(m, sizeof(m), "*** std::terminate: %s | last log line: %s", b, GLast);
+          		char m[400];
+          		snprintf(m, sizeof(m), "*** std::terminate called | last log line: %s", GLast);
           		LogLine(m, false);
           		void *bt[64]; int n = backtrace(bt, 64);
           		if (GFd >= 0) backtrace_symbols_fd(bt, n, GFd);
