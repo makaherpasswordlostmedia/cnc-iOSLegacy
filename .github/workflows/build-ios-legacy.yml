@@ -90,6 +90,7 @@ jobs:
           add_executable(CommandConquer
               "${CMAKE_CURRENT_LIST_DIR}/host/ios_diag.mm"
               "${CMAKE_CURRENT_LIST_DIR}/host/ios_availability_stub.m"
+              "${CMAKE_CURRENT_LIST_DIR}/host/libcxx_compat.cpp"
               ${CNC_SRCS})
           cnc95_configure_target(CommandConquer)
           get_target_property(_incs CommandConquer INCLUDE_DIRECTORIES)
@@ -537,7 +538,32 @@ jobs:
               return runningSubminor >= subminor;
           }
           EOF_FILE_5
-          cat > ios-legacy/resources/Info.plist <<'EOF_FILE_6'
+          cat > ios-legacy/host/libcxx_compat.cpp <<'EOF_FILE_6'
+          // libc++ 19 headers (Theos toolchain) call std::__libcpp_verbose_abort() from inline helpers such as
+          // __throw_length_error / __throw_bad_array_new_length. It lives in libc++ >= 15, but the iPhoneOS 9.3 SDK
+          // libc++.dylib (the one that actually ships on iOS 7-9) does not have it, so provide it here.
+          // Deliberately includes no libc++ header: the declaration there is noexcept/availability-annotated.
+          #include <stdarg.h>
+          #include <stdio.h>
+
+          extern "C" void abort(void) __attribute__((noreturn));
+
+          namespace std {
+          inline namespace __1 {
+          __attribute__((noreturn, visibility("default")))
+          void __libcpp_verbose_abort(const char *format, ...) noexcept
+          {
+          	va_list ap;
+          	va_start(ap, format);
+          	fputs("libc++ abort: ", stderr);
+          	vfprintf(stderr, format, ap);
+          	va_end(ap);
+          	abort();
+          }
+          } // namespace __1
+          } // namespace std
+          EOF_FILE_6
+          cat > ios-legacy/resources/Info.plist <<'EOF_FILE_7'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -568,8 +594,8 @@ jobs:
           	<key>UIFileSharingEnabled</key><true/>
           </dict>
           </plist>
-          EOF_FILE_6
-          cat > ios-legacy/resources/entitlements.plist <<'EOF_FILE_7'
+          EOF_FILE_7
+          cat > ios-legacy/resources/entitlements.plist <<'EOF_FILE_8'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -578,8 +604,8 @@ jobs:
           	<true/>
           </dict>
           </plist>
-          EOF_FILE_7
-          cat > ios-legacy/scripts/fetch_sdl.sh <<'EOF_FILE_8'
+          EOF_FILE_8
+          cat > ios-legacy/scripts/fetch_sdl.sh <<'EOF_FILE_9'
           #!/usr/bin/env bash
           # Fetch SDL 2.32.10 into ios-legacy/third_party/SDL and apply the iOS 7 / SDK 9.3 patch.
           # Usage: fetch_sdl.sh [path/to/SDL2-2.32.10.tar.gz]   (downloads if no tarball is given)
@@ -597,8 +623,8 @@ jobs:
           mv "$R/third_party/SDL2-$VER" "$DEST"
           patch -d "$DEST" -p1 < "$R/patches/sdl2-ios7.patch"
           echo "SDL $VER ready (iOS 7 patch applied) at $DEST"
-          EOF_FILE_8
-          cat > ios-legacy/scripts/package_ios.sh <<'EOF_FILE_9'
+          EOF_FILE_9
+          cat > ios-legacy/scripts/package_ios.sh <<'EOF_FILE_10'
           #!/usr/bin/env bash
           # Usage: package_ios.sh <build-dir> [out-dir] [--assets DIR]
           # -> <out>/CommandConquer.ipa (ldid fake-signed; for jailbroken / sideloaded iOS 7+ armv7 devices)
@@ -623,8 +649,8 @@ jobs:
           if [ -n "$LDID" ]; then "$LDID" -S"$R/resources/entitlements.plist" "$APP/CommandConquer"; else echo "warning: ldid not found, binary unsigned"; fi
           (cd "$OUT" && rm -f CommandConquer.ipa && zip -qr CommandConquer.ipa Payload)
           echo "built $OUT/CommandConquer.ipa"
-          EOF_FILE_9
-          cat > ios-legacy/scripts/gen_resources.py <<'EOF_FILE_10'
+          EOF_FILE_10
+          cat > ios-legacy/scripts/gen_resources.py <<'EOF_FILE_11'
           #!/usr/bin/env python3
           """Generate placeholder icons and black launch images (pure stdlib). Run once; PNGs are committed."""
           import struct, zlib, sys, os
@@ -646,8 +672,8 @@ jobs:
           for n, w, h in (("Default@2x.png", 640, 960), ("Default-568h@2x.png", 640, 1136),
                           ("Default-Landscape~ipad.png", 1024, 748), ("Default-Landscape@2x~ipad.png", 2048, 1496)):
               png(os.path.join(out, n), w, h, black)
-          EOF_FILE_10
-          cat > ios-legacy/scripts/case_mirror.py <<'EOF_FILE_11'
+          EOF_FILE_11
+          cat > ios-legacy/scripts/case_mirror.py <<'EOF_FILE_12'
           #!/usr/bin/env python3
           """Case-insensitive view of the source tree for case-sensitive hosts (Linux CI).
           The code base was written for case-insensitive file systems ("#include <Function.H>" -> FUNCTION.H).
@@ -681,7 +707,7 @@ jobs:
               if os.path.isdir(os.path.join(repo, t)):
                   mirror(os.path.join(repo, t), os.path.join(out, t))
           print("case mirror ready:", out)
-          EOF_FILE_11
+          EOF_FILE_12
           chmod +x ios-legacy/scripts/*.sh ios-legacy/scripts/*.py
           python3 -I ios-legacy/scripts/gen_resources.py ios-legacy/resources
           python3 - <<'EOF_PY'
