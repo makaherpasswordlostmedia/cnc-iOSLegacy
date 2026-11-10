@@ -115,7 +115,7 @@ jobs:
             "-framework UIKit" "-framework Foundation" "-framework OpenGLES" "-framework QuartzCore"
             "-framework CoreGraphics" "-framework AudioToolbox" "-framework CoreAudio" "-framework CoreMotion"
             "-framework CoreFoundation" "-framework AVFoundation" "-framework CoreVideo" "-framework CoreMedia"
-            "-weak_framework GameController" "-Wl,-dead_strip" c++)
+            "-weak_framework GameController" "-Wl,-dead_strip" "-Wl,-map,${CMAKE_BINARY_DIR}/CommandConquer.map" c++)
           EOF_FILE_0
           cat > ios-legacy/cmake/ios-armv7-toolchain.cmake <<'EOF_FILE_1'
           # Toolchain: iOS armv7 (min iOS 7.0) cross-compiled from Linux.
@@ -372,7 +372,10 @@ jobs:
           #include <string.h>
           #include <time.h>
           #include <unistd.h>
+          #include <errno.h>
           #include <exception>
+          #include <dlfcn.h>
+          #include <mach-o/dyld.h>
 
           static int GFd = -1;
           static pthread_mutex_t GLock = PTHREAD_MUTEX_INITIALIZER;
@@ -454,6 +457,59 @@ jobs:
           	LogLine(b, true);
           }
 
+
+          static pthread_t GMainThread;
+          static volatile time_t GLastChange = 0;
+
+          static void DumpBacktrace(const char *title)
+          {
+          	void *bt[48]; int n = backtrace(bt, 48);
+          	char b[400];
+          	snprintf(b, sizeof(b), "%s (image base=%p slide=0x%lx)", title,
+          		(void *)_dyld_get_image_header(0), (long)_dyld_get_image_vmaddr_slide(0));
+          	RawWrite(b); RawWrite("\n");
+          	for (int i = 0; i < n; i++) {
+          		Dl_info di; memset(&di, 0, sizeof(di));
+          		if (dladdr(bt[i], &di) && di.dli_sname)
+          			snprintf(b, sizeof(b), "   #%d %p %s+%ld (%s)\n", i, bt[i], di.dli_sname,
+          				(long)((char *)bt[i] - (char *)di.dli_saddr), di.dli_fname ? strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname : "?");
+          		else
+          			snprintf(b, sizeof(b), "   #%d %p (file offset 0x%lx)\n", i, bt[i],
+          				(long)((char *)bt[i] - (char *)_dyld_get_image_header(0)));
+          		RawWrite(b);
+          	}
+          }
+
+          // SIGUSR2 is delivered to the main thread when the log has been silent for a while: shows where it is stuck.
+          static void StackSampleHandler(int)
+          {
+          	DumpBacktrace("--- main thread stack sample ---");
+          }
+
+          // stderr/stdout of the game go through a pipe so every line gets a timestamp and updates "last log line".
+          static int GPipe[2] = { -1, -1 };
+          static void *PipeThread(void *)
+          {
+          	char buf[2048]; size_t len = 0;
+          	for (;;) {
+          		ssize_t r = read(GPipe[0], buf + len, sizeof(buf) - 1 - len);
+          		if (r <= 0) { if (r < 0 && errno == EINTR) continue; break; }
+          		len += (size_t)r;
+          		buf[len] = 0;
+          		char *start = buf, *nl;
+          		while ((nl = strchr(start, '\n')) != NULL) {
+          			*nl = 0;
+          			char *e = nl; while (e > start && e[-1] == '\r') *--e = 0;
+          			if (*start) { char m[1300]; snprintf(m, sizeof(m), "game: %s", start); LogLine(m, true); GLastChange = time(NULL); }
+          			start = nl + 1;
+          		}
+          		len = strlen(start);
+          		if (len >= sizeof(buf) - 1) { LogLine(start, true); len = 0; }
+          		memmove(buf, start, len);
+          	}
+          	return NULL;
+          }
+
           static void *HeartbeatThread(void *)
           {
           	int t = 0;
@@ -463,6 +519,8 @@ jobs:
           		char b[400];
           		snprintf(b, sizeof(b), "heartbeat +%ds | last log line: %s", t, GLast);
           		LogLine(b, false);
+          		// no new log line for 10s+ -> sample the main thread (repeat every other beat)
+          		if (t >= 10 && (t % 10 == 0 || t > 60)) pthread_kill(GMainThread, SIGUSR2);
           	}
           	return NULL;
           }
@@ -489,9 +547,33 @@ jobs:
           	NSSetUncaughtExceptionHandler(&ObjCExceptionHandler);
           	SDL_LogSetAllPriority(SDL_LOG_PRIORITY_INFO);
           	SDL_LogSetOutputFunction(SDLLogCB, NULL);
+          	GMainThread = pthread_self();
+          	struct sigaction su; memset(&su, 0, sizeof(su));
+          	su.sa_handler = StackSampleHandler; su.sa_flags = SA_ONSTACK; sigemptyset(&su.sa_mask);
+          	sigaction(SIGUSR2, &su, NULL);
           	pthread_t th;
           	if (pthread_create(&th, NULL, HeartbeatThread, NULL) == 0) pthread_detach(th);
-          	LogLine("diag: crash/exception/SDL handlers + heartbeat installed", true);
+          	// The game prints via fprintf(stderr) (OutputDebugString / CCDebugString): capture all of it in the log.
+          	EnsureOpen();
+          	if (pipe(GPipe) == 0) {
+          		dup2(GPipe[1], STDERR_FILENO);
+          		dup2(GPipe[1], STDOUT_FILENO);
+          		setvbuf(stdout, NULL, _IONBF, 0);
+          		setvbuf(stderr, NULL, _IONBF, 0);
+          		pthread_t pt;
+          		if (pthread_create(&pt, NULL, PipeThread, NULL) == 0) pthread_detach(pt);
+          	} else if (GFd >= 0) {
+          		dup2(GFd, STDERR_FILENO);
+          		dup2(GFd, STDOUT_FILENO);
+          	}
+          	{
+          		char e[600];
+          		snprintf(e, sizeof(e), "env: HOME=%s | main image base=%p slide=0x%lx | pid=%d",
+          			getenv("HOME") ? getenv("HOME") : "(null)", (void *)_dyld_get_image_header(0),
+          			(long)_dyld_get_image_vmaddr_slide(0), (int)getpid());
+          		LogLine(e, false);
+          	}
+          	LogLine("diag: crash/exception/SDL handlers, stderr capture, stall sampler installed", true);
           }
           EOF_FILE_4
           cat > ios-legacy/host/ios_availability_stub.m <<'EOF_FILE_5'
@@ -708,6 +790,61 @@ jobs:
                   mirror(os.path.join(repo, t), os.path.join(out, t))
           print("case mirror ready:", out)
           EOF_FILE_12
+          cat > ios-legacy/scripts/patch_ios_main_log.py <<'EOF_FILE_13'
+          #!/usr/bin/env python3
+          """Adds start-up diagnostics to PORT/IOS/src/ios_main.cpp (idempotent): logs the chosen working directory,
+          whether the game data (config_path) was found, and the hand-off to WinMain."""
+          p = "PORT/IOS/src/ios_main.cpp"
+          t = open(p).read()
+          AUDIT = r'''
+          static void audit_data(void)
+          {
+          	/* log what is really on disk: marker files + a listing of the data folders */
+          	static char const *const files[] = {
+          		"assets/cnc/gdi/INSTALL/CONQUER.INI", "assets/cnc/gdi/INSTALL/CCLOCAL.MIX", "assets/cnc/gdi/INSTALL/UPDATE.MIX",
+          		"assets/cnc/gdi/CONQUER.MIX", "assets/cnc/gdi/GENERAL.MIX", "assets/cnc/gdi/SOUNDS.MIX", "assets/cnc/gdi/SCORES.MIX",
+          		"assets/cnc/gdi/MOVIES.MIX", "assets/cnc/gdi/TRANSIT.MIX", "assets/cnc/gdi/SPEECH.MIX", 0 };
+          	for (int i = 0; files[i]; ++i) {
+          		struct stat info;
+          		if (stat(files[i], &info) == 0) SDL_Log("audit: %-40s %lld bytes", files[i], (long long)info.st_size);
+          		else SDL_Log("audit: %-40s MISSING (errno=%d)", files[i], errno);
+          	}
+          	static char const *const dirs[] = { "assets", "assets/cnc", "assets/cnc/gdi", "assets/cnc/gdi/INSTALL", 0 };
+          	for (int i = 0; dirs[i]; ++i) {
+          		DIR *d = opendir(dirs[i]);
+          		if (!d) { SDL_Log("audit: dir %s: cannot open (errno=%d)", dirs[i], errno); continue; }
+          		std::string list; int n = 0; struct dirent *e;
+          		while ((e = readdir(d)) != 0 && n < 60) {
+          			if (e->d_name[0] == '.') continue;
+          			list += e->d_name; list += ' '; ++n;
+          		}
+          		closedir(d);
+          		SDL_Log("audit: dir %s: %s", dirs[i], list.c_str());
+          	}
+          }
+          '''
+          if "ios_main: cwd" not in t:
+              anchor = 'extern "C" int SDL_main('
+              assert anchor in t
+              t = t.replace(anchor, AUDIT + "\n" + anchor, 1)
+              old = "\tselect_resource_root();\n\n\tstd::string command_line;"
+              assert old in t, "SDL_main anchor not found"
+              new = (
+                  "\tselect_resource_root();\n"
+                  "\t{\n"
+                  "\t\tchar cwd[1024];\n"
+                  "\t\tif (!getcwd(cwd, sizeof(cwd))) { cwd[0] = '?'; cwd[1] = 0; }\n"
+                  "\t\tSDL_Log(\"ios_main: cwd=%s\", cwd);\n"
+                  "\t\tSDL_Log(\"ios_main: data %s = %s\", config_path(), path_exists(config_path()) ? \"FOUND\" : \"MISSING\");\n"
+                  "\t\taudit_data();\n"
+                  "\t\tSDL_Log(\"ios_main: entering WinMain\");\n"
+                  "\t}\n\n"
+                  "\tstd::string command_line;"
+              )
+              t = t.replace(old, new, 1)
+              open(p, "w").write(t)
+          print("ios_main.cpp start-up logging ok")
+          EOF_FILE_13
           chmod +x ios-legacy/scripts/*.sh ios-legacy/scripts/*.py
           python3 -I ios-legacy/scripts/gen_resources.py ios-legacy/resources
           python3 - <<'EOF_PY'
@@ -735,6 +872,7 @@ jobs:
               open(p, "w").write(t)
           print("ios_main.cpp patched")
           EOF_PY
+          python3 -I ios-legacy/scripts/patch_ios_main_log.py
 
       - name: Theos + toolchain + iPhoneOS 9.3 SDK
         run: |
@@ -785,6 +923,7 @@ jobs:
         run: |
           set -o pipefail
           cmake --build build -j"$(nproc)" -- -k 0 2>&1 | tee build-make.log
+          cp build/CommandConquer.map build-link-map.log 2>/dev/null || true
       - name: Verify Mach-O is armv7
         run: |
           file build/CommandConquer || true
