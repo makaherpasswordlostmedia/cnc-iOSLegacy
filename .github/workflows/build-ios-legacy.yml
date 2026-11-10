@@ -199,8 +199,8 @@ jobs:
                list(APPEND PKGCONFIG_LDFLAGS "-Wl,-framework,Foundation")
           diff -ruN a/src/audio/coreaudio/SDL_coreaudio.m b/src/audio/coreaudio/SDL_coreaudio.m
           --- a/src/audio/coreaudio/SDL_coreaudio.m	2026-11-10 05:41:22.501202592 +0000
-          +++ b/src/audio/coreaudio/SDL_coreaudio.m	2026-11-10 05:41:22.548469835 +0000
-          @@ -418,8 +418,8 @@
+          +++ b/src/audio/coreaudio/SDL_coreaudio.m	2026-11-10 10:46:57.243164976 +0000
+          @@ -418,22 +418,22 @@
                        options |= 0x4; /* AVAudioSessionCategoryOptionAllowBluetooth; */
                    }
                    if (category == AVAudioSessionCategoryPlayAndRecord) {
@@ -211,6 +211,22 @@ jobs:
                    }
                    if (category == AVAudioSessionCategoryPlayback ||
                        category == AVAudioSessionCategoryPlayAndRecord) {
+                       options |= AVAudioSessionCategoryOptionDuckOthers;
+                   }
+           
+          -        if ([session respondsToSelector:@selector(setCategory:mode:options:error:)]) {
+          +        if ([session respondsToSelector:@selector(setCategory:withOptions:error:)]) {
+                       if (![session.category isEqualToString:category] || session.categoryOptions != options) {
+                           /* Stop the current session so we don't interrupt other application audio */
+                           pause_audio_devices();
+                           [session setActive:NO error:nil];
+                           session_active = NO;
+           
+          -                if (![session setCategory:category mode:mode options:options error:&err]) {
+          +                if (![session setCategory:category withOptions:options error:&err] /* mode variant is iOS 10+ */) {
+                               NSString *desc = err.description;
+                               SDL_SetError("Could not set Audio Session category: %s", desc.UTF8String);
+                               return NO;
           diff -ruN a/src/joystick/SDL_joystick.c b/src/joystick/SDL_joystick.c
           --- a/src/joystick/SDL_joystick.c	2026-11-10 05:41:22.274892760 +0000
           +++ b/src/joystick/SDL_joystick.c	2026-11-10 05:41:22.338892764 +0000
@@ -664,7 +680,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          cmake --build build -j"$(nproc)" 2>&1 | tee build-make.log
+          cmake --build build -j"$(nproc)" -- -k 0 2>&1 | tee build-make.log
       - name: Verify Mach-O is armv7
         run: |
           file build/CommandConquer || true
