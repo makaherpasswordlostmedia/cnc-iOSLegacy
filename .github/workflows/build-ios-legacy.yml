@@ -60,15 +60,41 @@ jobs:
           # game sources / defines / include dirs (shared with the mac/android/ios builds)
           include("${CMAKE_CURRENT_LIST_DIR}/../cmake/cnc95_common.cmake")
 
-          add_executable(CommandConquer
+          # The code base relies on case-insensitive #include / file names; a Linux host is case-sensitive.
+          # Build a symlink mirror with all case variants and compile/include everything through it.
+          find_program(CNC_HOST_PYTHON NAMES python3 python REQUIRED)
+          set(CNC_CM "${CMAKE_BINARY_DIR}/casemirror")
+          execute_process(COMMAND "${CNC_HOST_PYTHON}" "${CMAKE_CURRENT_LIST_DIR}/scripts/case_mirror.py" "${CNC95_REPO_ROOT}" "${CNC_CM}"
+                          RESULT_VARIABLE _cm_rc)
+          if(NOT _cm_rc EQUAL 0)
+            message(FATAL_ERROR "case_mirror.py failed")
+          endif()
+          function(cnc_remap out)
+            set(_o)
+            foreach(p ${ARGN})
+              string(FIND "${p}" "${CNC95_REPO_ROOT}/" _pos)
+              if(_pos EQUAL 0)
+                string(LENGTH "${CNC95_REPO_ROOT}/" _len)
+                string(SUBSTRING "${p}" ${_len} -1 _rel)
+                list(APPEND _o "${CNC_CM}/${_rel}")
+              else()
+                list(APPEND _o "${p}")
+              endif()
+            endforeach()
+            set(${out} "${_o}" PARENT_SCOPE)
+          endfunction()
+
+          cnc_remap(CNC_SRCS
               "${CNC95_REPO_ROOT}/PORT/IOS/src/ios_main.cpp"
+              ${CNC95_PLATFORM_SDL_SOURCES} ${CNC95_SOURCES} ${CNC95_SUPPORT_SOURCES})
+          add_executable(CommandConquer
               "${CMAKE_CURRENT_LIST_DIR}/host/ios_diag.mm"
               "${CMAKE_CURRENT_LIST_DIR}/host/ios_availability_stub.m"
-              ${CNC95_PLATFORM_SDL_SOURCES}
-              ${CNC95_SOURCES}
-              ${CNC95_SUPPORT_SOURCES}
-          )
+              ${CNC_SRCS})
           cnc95_configure_target(CommandConquer)
+          get_target_property(_incs CommandConquer INCLUDE_DIRECTORIES)
+          cnc_remap(_incs_cm ${_incs})
+          set_target_properties(CommandConquer PROPERTIES INCLUDE_DIRECTORIES "${_incs_cm}")
 
           target_compile_definitions(CommandConquer PRIVATE RA_IOS RA_IOS_LEGACY RA_MOBILE_TOUCH)
           # 1995 code: do not let the optimizer exploit strict aliasing on type-punned buffers.
@@ -622,7 +648,42 @@ jobs:
                           ("Default-Landscape~ipad.png", 1024, 748), ("Default-Landscape@2x~ipad.png", 2048, 1496)):
               png(os.path.join(out, n), w, h, black)
           EOF_FILE_10
-          chmod +x ios-legacy/scripts/*.sh ios-legacy/scripts/gen_resources.py
+          cat > ios-legacy/scripts/case_mirror.py <<'EOF_FILE_11'
+          #!/usr/bin/env python3
+          """Case-insensitive view of the source tree for case-sensitive hosts (Linux CI).
+          The code base was written for case-insensitive file systems ("#include <Function.H>" -> FUNCTION.H).
+          Usage: case_mirror.py <repo-root> <out-dir>
+          Creates <out-dir>/<TOP>/... mirroring CODE WIN32LIB WWFLAT32 WINVQ VQ PORT with symlinks under every
+          case variant of each file and directory name (original, lower, upper, name-lower+EXT-upper, ...)."""
+          import os, shutil, sys
+          repo, out = sys.argv[1], sys.argv[2]
+          TOP = ("CODE", "WIN32LIB", "WWFLAT32", "WINVQ", "VQ", "PORT")
+          def variants(n):
+              b, e = os.path.splitext(n)
+              return {n, n.lower(), n.upper(), b.lower() + e.upper(), b.upper() + e.lower()}
+          def mirror(src, dst):
+              os.makedirs(dst, exist_ok=True)
+              for n in sorted(os.listdir(src)):
+                  p = os.path.join(src, n)
+                  if os.path.isdir(p):
+                      sub = os.path.join(dst, n)
+                      mirror(p, sub)
+                      for v in (n.lower(), n.upper()):
+                          q = os.path.join(dst, v)
+                          if not os.path.lexists(q):
+                              os.symlink(sub, q)
+                  else:
+                      for v in variants(n):
+                          q = os.path.join(dst, v)
+                          if not os.path.lexists(q):
+                              os.symlink(p, q)
+          shutil.rmtree(out, ignore_errors=True)
+          for t in TOP:
+              if os.path.isdir(os.path.join(repo, t)):
+                  mirror(os.path.join(repo, t), os.path.join(out, t))
+          print("case mirror ready:", out)
+          EOF_FILE_11
+          chmod +x ios-legacy/scripts/*.sh ios-legacy/scripts/*.py
           python3 -I ios-legacy/scripts/gen_resources.py ios-legacy/resources
           python3 - <<'EOF_PY'
           p = "PORT/IOS/src/ios_main.cpp"
@@ -667,6 +728,24 @@ jobs:
           find "$SDK/usr/include" -name module.map | while read -r m; do mv "$m" "$(dirname "$m")/module.modulemap"; done
           TB="$THEOS/toolchain/linux/iphone/bin"
           [ -e "$TB/aarch64-apple-darwin14-ranlib" ] || ln -sf "$TB/llvm-ranlib" "$TB/aarch64-apple-darwin14-ranlib" 2>/dev/null || true
+          # toolchain libc++ 19 headers need a __config_site (the SDK 9.3 tarball has no libc++ headers)
+          CS="$TB/../include/c++/v1/__config_site"
+          if [ -d "$SDK/usr/include/c++/v1" ]; then echo "SDK libc++ headers: ok"
+          elif [ ! -f "$CS" ]; then
+            FOUND="$(find "$THEOS/toolchain" -name '__config_site' 2>/dev/null | head -n1)"
+            if [ -n "$FOUND" ]; then cp "$FOUND" "$CS"; else
+              cat > "$CS" <<'EOF_CS'
+          #ifndef _LIBCPP_CONFIG_SITE
+          #define _LIBCPP_CONFIG_SITE
+          #define _LIBCPP_ABI_VERSION 1
+          #define _LIBCPP_ABI_NAMESPACE __1
+          #define _LIBCPP_HAS_THREAD_API_PTHREAD 1
+          #define _LIBCPP_HARDENING_MODE_DEFAULT _LIBCPP_HARDENING_MODE_NONE
+          #define _LIBCPP_PSTL_BACKEND_SERIAL 1
+          #endif
+          EOF_CS
+            fi
+          fi
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
       - name: Fetch + patch SDL2
         run: ios-legacy/scripts/fetch_sdl.sh
