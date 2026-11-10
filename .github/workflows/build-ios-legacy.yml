@@ -657,7 +657,9 @@ jobs:
       - name: Configure
         run: |
           set -o pipefail
-          cmake -S ios-legacy -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=ios-legacy/cmake/ios-armv7-toolchain.cmake 2>&1 | tee build-configure.log || {
+          command -v ninja && ninja --version
+          # absolute path: with -S ios-legacy a relative toolchain path is resolved inside ios-legacy/
+          cmake -S "$GITHUB_WORKSPACE/ios-legacy" -B "$GITHUB_WORKSPACE/build" -G Ninja -DCMAKE_MAKE_PROGRAM="$(command -v ninja)" -DCMAKE_TOOLCHAIN_FILE="$GITHUB_WORKSPACE/ios-legacy/cmake/ios-armv7-toolchain.cmake" 2>&1 | tee build-configure.log || {
             tail -n 120 build/CMakeFiles/CMakeError.log || true; exit 1; }
       - name: Build
         run: |
