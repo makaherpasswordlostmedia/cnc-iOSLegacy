@@ -375,6 +375,7 @@ jobs:
           #include <errno.h>
           #include <exception>
           #include <dlfcn.h>
+          #include <mach/mach.h>
           #include <mach-o/dyld.h>
 
           static int GFd = -1;
@@ -510,16 +511,64 @@ jobs:
           	return NULL;
           }
 
+
+          static long ResidentMB(void)
+          {
+          	struct mach_task_basic_info info;
+          	mach_msg_type_number_t cnt = MACH_TASK_BASIC_INFO_COUNT;
+          	if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &cnt) != KERN_SUCCESS) return -1;
+          	return (long)(info.resident_size / (1024 * 1024));
+          }
+
+          static void AtExitLog(void)
+          {
+          	char b[300];
+          	snprintf(b, sizeof(b), "*** process exiting normally (atexit) | rss=%ldMB | last log line: %s", ResidentMB(), GLast);
+          	LogLine(b, false);
+          }
+
+          // SDL app lifecycle events: low memory / background / terminate explain silent kills.
+          static int SDLCALL AppEventWatch(void *, SDL_Event *e)
+          {
+          	const char *n = NULL;
+          	switch (e->type) {
+          		case SDL_APP_TERMINATING: n = "SDL_APP_TERMINATING"; break;
+          		case SDL_APP_LOWMEMORY: n = "SDL_APP_LOWMEMORY (memory warning!)"; break;
+          		case SDL_APP_WILLENTERBACKGROUND: n = "SDL_APP_WILLENTERBACKGROUND"; break;
+          		case SDL_APP_DIDENTERBACKGROUND: n = "SDL_APP_DIDENTERBACKGROUND"; break;
+          		case SDL_APP_WILLENTERFOREGROUND: n = "SDL_APP_WILLENTERFOREGROUND"; break;
+          		case SDL_APP_DIDENTERFOREGROUND: n = "SDL_APP_DIDENTERFOREGROUND"; break;
+          		case SDL_QUIT: n = "SDL_QUIT"; break;
+          		default: break;
+          	}
+          	if (n) {
+          		char b[200];
+          		snprintf(b, sizeof(b), "event: %s | rss=%ldMB", n, ResidentMB());
+          		LogLine(b, false);
+          	}
+          	return 0;
+          }
+
+          static void SigTermHandler(int sig)
+          {
+          	char b[200];
+          	snprintf(b, sizeof(b), "*** received signal %d (%s) - process is being terminated | last log line: %s", sig, strsignal(sig), GLast);
+          	RawWrite(b); RawWrite("\n");
+          	signal(sig, SIG_DFL);
+          	raise(sig);
+          }
+
           static void *HeartbeatThread(void *)
           {
           	int t = 0;
           	for (;;) {
-          		sleep(t < 60 ? 5 : 30);
-          		t += (t < 60 ? 5 : 30);
-          		char b[400];
-          		snprintf(b, sizeof(b), "heartbeat +%ds | last log line: %s", t, GLast);
+          		int step = t < 20 ? 1 : (t < 60 ? 5 : 30);
+          		sleep(step);
+          		t += step;
+          		char b[500];
+          		snprintf(b, sizeof(b), "heartbeat +%ds rss=%ldMB | last log line: %s", t, ResidentMB(), GLast);
           		LogLine(b, false);
-          		// no new log line for 10s+ -> sample the main thread (repeat every other beat)
+          		// no new log line for 10s+ -> sample the main thread (repeat every 10s)
           		if (t >= 10 && (t % 10 == 0 || t > 60)) pthread_kill(GMainThread, SIGUSR2);
           	}
           	return NULL;
@@ -547,6 +596,11 @@ jobs:
           	NSSetUncaughtExceptionHandler(&ObjCExceptionHandler);
           	SDL_LogSetAllPriority(SDL_LOG_PRIORITY_INFO);
           	SDL_LogSetOutputFunction(SDLLogCB, NULL);
+          	atexit(AtExitLog);
+          	signal(SIGTERM, SigTermHandler);
+          	signal(SIGINT, SigTermHandler);
+          	signal(SIGHUP, SigTermHandler);
+          	SDL_AddEventWatch(AppEventWatch, NULL);
           	GMainThread = pthread_self();
           	struct sigaction su; memset(&su, 0, sizeof(su));
           	su.sa_handler = StackSampleHandler; su.sa_flags = SA_ONSTACK; sigemptyset(&su.sa_mask);
@@ -845,6 +899,77 @@ jobs:
               open(p, "w").write(t)
           print("ios_main.cpp start-up logging ok")
           EOF_FILE_13
+          cat > ios-legacy/scripts/patch_trace.py <<'EOF_FILE_14'
+          #!/usr/bin/env python3
+          """Adds crash-trace logging to the game sources (idempotent, run from the repo root).
+          Everything goes to stderr / SDL_Log, which ios_diag.mm timestamps into Documents/cnc_ios.log:
+            * every Alloc >= 1 MB and every failed allocation
+            * every failed file open (name, rights, errno)
+            * DirectDraw surface creation
+            * SDL window / texture creation results and the first presented frames"""
+          import re, sys
+
+          def edit(path, fn):
+              raw = open(path, "rb").read()
+              t = raw.decode("latin-1")          # sources are Windows-1252: keep every byte as is
+              new = fn(t)
+              if new != t:
+                  open(path, "wb").write(new.encode("latin-1"))
+                  print("trace patch:", path)
+              else:
+                  print("trace patch (nothing to do):", path)
+
+          MARK = "/*cnc-trace*/"
+
+          def alloc(t):
+              if MARK in t:
+                  return t
+              t = MARK + "\n#include <stdio.h>\n" + t
+              a = "mem_ptr = malloc ( bytes_to_alloc );"
+              if a in t:
+                  t = t.replace(a, a + '\n\tif (bytes_to_alloc >= 1048576 || !mem_ptr) fprintf(stderr, "alloc: %lu bytes -> %p%s\\n", (unsigned long)bytes_to_alloc, mem_ptr, mem_ptr ? "" : " FAILED");', 1)
+              b = "retval = (unsigned char*)malloc(bytes_to_alloc);"
+              if b in t:
+                  t = t.replace(b, b + '\n\t\tif (bytes_to_alloc >= 1048576 || !retval) fprintf(stderr, "alloc: %lu bytes -> %p%s\\n", (unsigned long)bytes_to_alloc, retval, retval ? "" : " FAILED");', 1)
+              return t
+
+          def rawfile(t):
+              if MARK in t:
+                  return t
+              i = t.index("int RawFileClass::Open(int rights)")
+              m = re.compile(r"if \(Handle < 0\) \{").search(t, i)
+              assert m, "RawFileClass::Open handle check not found"
+              log = '\n\t\t\tfprintf(stderr, "file: open FAILED \'%s\' rights=%d errno=%d (%s)\\n", Filename ? Filename : "(null)", rights, errno, strerror(errno));'
+              t = t[:m.end()] + log + t[m.end():]
+              return MARK + "\n#include <stdio.h>\n#include <string.h>\n#include <errno.h>\n" + t
+
+          def ddraw(t):
+              if MARK in t:
+                  return t
+              a = "*surface = new IDirectDrawSurface(width, height, caps, external);"
+              assert a in t, "CreateSurface anchor not found"
+              t = t.replace(a, a + '\n\t\tfprintf(stderr, "ddraw: CreateSurface %dx%d caps=0x%lx external=%p -> %p\\n", width, height, (unsigned long)caps, external, (void *)*surface);', 1)
+              return t.replace("class IDirectDraw {", MARK + "\nclass IDirectDraw {", 1)
+
+          def sdlrt(t):
+              if MARK in t:
+                  return t
+              a = "\tif (!MacWindow) {\n\t\treturn false;\n\t}\n"
+              assert a in t, "window anchor not found"
+              t = t.replace(a, '\tSDL_Log("mac: SDL_CreateWindow %dx%d -> %p %s", width, height, (void *)MacWindow, MacWindow ? "ok" : SDL_GetError());\n' + a, 1)
+              c = "\tMacTexture = SDL_CreateTexture(MacRenderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, width, height);\n"
+              assert c in t, "texture anchor not found"
+              t = t.replace(c, c + '\tSDL_Log("mac: SDL_CreateTexture %dx%d -> %p %s", width, height, (void *)MacTexture, MacTexture ? "ok" : SDL_GetError());\n', 1)
+              p = "\tmac_sdl_pump_events(false);\n\tif (!MacRenderer || !MacTexture) {"
+              assert p in t, "present anchor not found"
+              t = t.replace(p, '\t{ static int pf = 0; ++pf; if (pf <= 5 || pf % 600 == 0) SDL_Log("mac: present frame %d (%dx%d)", pf, width, height); }\n' + p, 1)
+              return MARK + "\n" + t
+
+          edit("WIN32LIB/MEM/ALLOC.CPP", alloc)
+          edit("CODE/RAWFILE.CPP", rawfile)
+          edit("PORT/MAC/include/ddraw.h", ddraw)
+          edit("PORT/MAC/src/mac_sdl_runtime.cpp", sdlrt)
+          EOF_FILE_14
           chmod +x ios-legacy/scripts/*.sh ios-legacy/scripts/*.py
           python3 -I ios-legacy/scripts/gen_resources.py ios-legacy/resources
           python3 - <<'EOF_PY'
@@ -940,16 +1065,39 @@ jobs:
                       if (!find_file_rec(search[k], "CONQUER.INI", 7, hit)) continue;
                       SDL_Log("found CONQUER.INI at %s", hit.c_str());
                       std::string install = parent_path(hit);
-                      std::string gdi = parent_path(install);
                       std::string auto_root = "/var/mobile/Documents/cnc-auto";
-                      make_directories(join_path(auto_root, "assets/cnc"));
-                      std::string link = join_path(auto_root, "assets/cnc/gdi");
-                      unlink(link.c_str());
-                      if (symlink(gdi.c_str(), link.c_str()) == 0 && use_resource_root(auto_root)) {
-                          SDL_Log("using %s -> %s", link.c_str(), gdi.c_str());
+                      std::string gdi = join_path(auto_root, "assets/cnc/gdi");
+                      unlink(gdi.c_str()); /* symlink left by an older build */
+                      make_directories(gdi);
+                      std::string ilink = join_path(gdi, "INSTALL");
+                      unlink(ilink.c_str());
+                      if (symlink(install.c_str(), ilink.c_str()) != 0) SDL_Log("symlink INSTALL failed (errno=%d)", errno);
+                      else SDL_Log("linked %s -> %s", ilink.c_str(), install.c_str());
+                      /* link the game .MIX files that sit next to CONQUER.MIX */
+                      std::string mixhit;
+                      if (find_file_rec(search[k], "CONQUER.MIX", 7, mixhit)) {
+                          std::string mixdir = parent_path(mixhit);
+                          SDL_Log("found CONQUER.MIX in %s", mixdir.c_str());
+                          DIR *md = opendir(mixdir.c_str());
+                          int linked = 0;
+                          struct dirent *me;
+                          while (md && (me = readdir(md)) != 0) {
+                              size_t nl = strlen(me->d_name);
+                              if (nl < 5 || strcasecmp(me->d_name + nl - 4, ".mix") != 0) continue;
+                              std::string dst = join_path(gdi, me->d_name);
+                              unlink(dst.c_str());
+                              if (symlink(join_path(mixdir, me->d_name).c_str(), dst.c_str()) == 0) ++linked;
+                          }
+                          if (md) closedir(md);
+                          SDL_Log("linked %d .MIX files into %s", linked, gdi.c_str());
+                      } else {
+                          SDL_Log("CONQUER.MIX was not found anywhere under %s", search[k]);
+                      }
+                      if (use_resource_root(auto_root)) {
+                          SDL_Log("using data root %s", auto_root.c_str());
                           return;
                       }
-                      SDL_Log("could not use %s (errno=%d)", gdi.c_str(), errno);
+                      SDL_Log("could not use %s (errno=%d)", auto_root.c_str(), errno);
                   }
                   SDL_Log("CONQUER.INI was not found anywhere: copy the data so that this exists: /var/mobile/Documents/assets/cnc/gdi/INSTALL/CONQUER.INI");
               }
@@ -962,6 +1110,7 @@ jobs:
           print("ios_main.cpp patched")
           EOF_PY
           python3 -I ios-legacy/scripts/patch_ios_main_log.py
+          python3 -I ios-legacy/scripts/patch_trace.py
 
       - name: Theos + toolchain + iPhoneOS 9.3 SDK
         run: |
