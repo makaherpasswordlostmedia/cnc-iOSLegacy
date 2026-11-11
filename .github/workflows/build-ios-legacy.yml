@@ -853,22 +853,61 @@ jobs:
           if "RA_IOS_LEGACY" not in t:
               old = "static void select_resource_root(void)\n{\n"
               new = old + """#if defined(RA_IOS_LEGACY)
-          \t/* iOS 7 build: game data lives in the app's Documents folder (iTunes file sharing / SSH):
-          \t * Documents/assets/cnc/... or Documents/cnc-root/assets/cnc/... */
-          \t{
-          \t\tchar const *home = getenv("HOME");
-          \t\tif (home && home[0]) {
-          \t\t\tstd::string docs = join_path(home, "Documents");
-          \t\t\tif (use_resource_root(docs) || use_resource_root(join_path(docs, "cnc-root"))) {
-          \t\t\t\treturn;
-          \t\t\t}
-          \t\t}
-          \t}
+              /* iOS 7 build: look for assets/cnc/gdi/INSTALL/CONQUER.INI in every place the data can plausibly be.
+               * Jailbreak (.deb / ldid) builds run unsandboxed as mobile, so HOME is /var/mobile and iTunes
+               * file sharing is NOT the folder in use: Documents is then /var/mobile/Documents. */
+              {
+                  std::vector<std::string> roots;
+                  char const *home = getenv("HOME");
+                  if (home && home[0]) {
+                      roots.push_back(join_path(home, "Documents"));
+                      roots.push_back(join_path(home, "Documents/cnc-root"));
+                      roots.push_back(join_path(home, "Media"));
+                      roots.push_back(join_path(home, "cnc-root"));
+                  }
+                  roots.push_back("/var/mobile/Documents");
+                  roots.push_back("/var/mobile/Documents/cnc-root");
+                  roots.push_back("/var/mobile/Media");
+                  roots.push_back("/var/mobile/Media/cnc-root");
+                  roots.push_back("/var/mobile/Media/Documents");
+                  roots.push_back("/var/mobile/cnc-root");
+                  roots.push_back("/var/root/Documents");
+                  char *base = SDL_GetBasePath();
+                  if (base) {
+                      roots.push_back(base);
+                      roots.push_back(join_path(base, "cnc-root"));
+                      SDL_free(base);
+                  }
+                  /* app sandbox containers (iOS 7: /var/mobile/Applications/<UUID>, iOS 8+: Containers/Data/Application) */
+                  static char const *const containers[] = { "/var/mobile/Applications", "/var/mobile/Containers/Data/Application", 0 };
+                  for (int c = 0; containers[c]; ++c) {
+                      DIR *d = opendir(containers[c]);
+                      if (!d) continue;
+                      struct dirent *e;
+                      while ((e = readdir(d)) != 0) {
+                          if (e->d_name[0] == '.') continue;
+                          std::string docs = join_path(join_path(containers[c], e->d_name), "Documents");
+                          roots.push_back(docs);
+                          roots.push_back(join_path(docs, "cnc-root"));
+                      }
+                      closedir(d);
+                  }
+                  for (size_t i = 0; i < roots.size(); ++i) {
+                      bool found = use_resource_root(roots[i]);
+                      if (found || i < 12) {
+                          SDL_Log("data root %s: %s", roots[i].c_str(), found ? "FOUND" : "no CONQUER.INI");
+                      }
+                      if (found) {
+                          return;
+                      }
+                  }
+                  SDL_Log("data root: nothing found in %d candidate folders", (int)roots.size());
+              }
           #endif
           """
               assert old in t
               t = t.replace(old, new, 1)
-              t = t.replace("#include <limits.h>\n", "#include <limits.h>\n#include <stdlib.h>\n", 1)
+              t = t.replace("#include <limits.h>\n", "#include <limits.h>\n#include <stdlib.h>\n#include <vector>\n", 1)
               open(p, "w").write(t)
           print("ios_main.cpp patched")
           EOF_PY
