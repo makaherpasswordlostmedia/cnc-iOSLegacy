@@ -965,10 +965,74 @@ jobs:
               t = t.replace(p, '\t{ static int pf = 0; ++pf; if (pf <= 5 || pf % 600 == 0) SDL_Log("mac: present frame %d (%dx%d)", pf, width, height); }\n' + p, 1)
               return MARK + "\n" + t
 
+          def startup(t):
+              if MARK in t:
+                  return t
+              a = "cfile.Write(buffer, strlen(buffer));"
+              assert a in t, "CONQUER.INI write anchor not found"
+              new = ('#if defined(__APPLE__) || defined(RA_ANDROID) || defined(RA_IOS)\n'
+                     '\t\t\tif (access("assets/cnc/gdi/INSTALL/CONQUER.INI", W_OK) == 0) {\n'
+                     '\t\t\t\tcfile.Write(buffer, strlen(buffer));\n'
+                     '\t\t\t} else {\n'
+                     '\t\t\t\tfprintf(stderr, "CONQUER.INI is read-only for this user (errno=%d): skipping rewrite. Fix: chown -R mobile:mobile /var/mobile/Documents/assets\\n", errno);\n'
+                     '\t\t\t}\n'
+                     '#else\n\t\t\tcfile.Write(buffer, strlen(buffer));\n#endif')
+              t = t.replace(a, new, 1)
+              return MARK + "\n#include <stdio.h>\n#include <errno.h>\n#include <unistd.h>\n" + t
+
+          def ccfile(t):
+              if MARK in t:
+                  return t
+              a = "void CCFileClass::Error(int error, int, char const *filename)\n{\n"
+              assert a in t, "CCFileClass::Error anchor not found"
+              guard = ('#if defined(__APPLE__) || defined(RA_ANDROID) || defined(RA_IOS)\n'
+                       '\t{\n'
+                       '\t\tstatic int repeats = 0;\n'
+                       '\t\tstatic char last[300];\n'
+                       '\t\tchar const *nm = filename ? filename : "";\n'
+                       '\t\tif (strncmp(last, nm, sizeof(last) - 1) == 0) { ++repeats; } else { repeats = 0; strncpy(last, nm, sizeof(last) - 1); last[sizeof(last) - 1] = 0; }\n'
+                       '\t\tif (repeats >= 3) {\n'
+                       '\t\t\tfprintf(stderr, "FATAL: giving up after repeated failures to open \'%s\' (%s)\\n", nm, strerror(error));\n'
+                       '\t\t\texit(EXIT_FAILURE);\n'
+                       '\t\t}\n'
+                       '\t}\n'
+                       '#endif\n')
+              t = t.replace(a, a + guard, 1)
+              return MARK + "\n#include <stdio.h>\n#include <string.h>\n#include <stdlib.h>\n" + t
+
+          def mixfile(t):
+              if MARK in t:
+                  return t
+              a = "Filename = strdup(file.File_Name());"
+              assert a in t, "MixFileClass filename anchor not found"
+              t = t.replace(a, a + '\n\tfprintf(stderr, "mix: register \'%s\' -> \'%s\'\\n", filename, Filename);', 1)
+              b = "if (file.Is_Available(true)) {"
+              assert b in t, "MixFileClass available anchor not found"
+              t = t.replace(b, 'int mix_avail = file.Is_Available(true);\n\tfprintf(stderr, "mix: \'%s\' %s\\n", Filename, mix_avail ? "available" : "NOT available (skipped, not registered)");\n\tif (mix_avail) {', 1)
+              c = "DataSize = fileheader.size;"
+              assert c in t, "MixFileClass datasize anchor not found"
+              t = t.replace(c, c + '\n\t\tfprintf(stderr, "mix: \'%s\' entries=%d datasize=%ld\\n", Filename, Count, (long)DataSize);', 1)
+              return MARK + "\n#include <stdio.h>\n" + t
+
+          def cdfile(t):
+              if MARK in t:
+                  return t
+              a = "srch->Path = strdup(paths[index]);"
+              assert a in t, "Add_Search_Drive anchor not found"
+              t = t.replace(a, a + '\n\t\tfprintf(stderr, "search path added: %s\\n", srch->Path);', 1)
+              b = "if (!pathlist) return(0);"
+              assert b in t, "Set_Search_Drives anchor not found"
+              t = t.replace(b, b + '\n\tfprintf(stderr, "Set_Search_Drives(\'%s\') CurrentCDDrive=%d\\n", pathlist, CurrentCDDrive);', 1)
+              return MARK + "\n#include <stdio.h>\n" + t
+
           edit("WIN32LIB/MEM/ALLOC.CPP", alloc)
+          edit("CODE/STARTUP.CPP", startup)
           edit("CODE/RAWFILE.CPP", rawfile)
           edit("PORT/MAC/include/ddraw.h", ddraw)
           edit("PORT/MAC/src/mac_sdl_runtime.cpp", sdlrt)
+          edit("CODE/CCFILE.CPP", ccfile)
+          edit("CODE/MIXFILE.CPP", mixfile)
+          edit("CODE/CDFILE.CPP", cdfile)
           EOF_FILE_14
           chmod +x ios-legacy/scripts/*.sh ios-legacy/scripts/*.py
           python3 -I ios-legacy/scripts/gen_resources.py ios-legacy/resources
