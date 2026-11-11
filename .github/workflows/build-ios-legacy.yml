@@ -852,7 +852,36 @@ jobs:
           t = open(p).read()
           if "RA_IOS_LEGACY" not in t:
               old = "static void select_resource_root(void)\n{\n"
-              new = old + """#if defined(RA_IOS_LEGACY)
+              helper = """#if defined(RA_IOS_LEGACY)
+          static bool find_file_rec(std::string const &dir, char const *name, int depth, std::string &out)
+          {
+              if (depth < 0) return false;
+              DIR *d = opendir(dir.c_str());
+              if (!d) return false;
+              struct dirent *e;
+              while ((e = readdir(d)) != 0) {
+                  if (e->d_name[0] == '.') continue;
+                  std::string p = join_path(dir, e->d_name);
+                  if (strcasecmp(e->d_name, name) == 0) { out = p; closedir(d); return true; }
+                  struct stat st;
+                  if (lstat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && find_file_rec(p, name, depth - 1, out)) { closedir(d); return true; }
+              }
+              closedir(d);
+              return false;
+          }
+
+          static void log_dir(char const *dir)
+          {
+              DIR *d = opendir(dir);
+              if (!d) { SDL_Log("ls %s: cannot open (errno=%d)", dir, errno); return; }
+              std::string list; int n = 0; struct dirent *e;
+              while ((e = readdir(d)) != 0 && n < 50) { if (e->d_name[0] == '.') continue; list += e->d_name; list += ' '; ++n; }
+              closedir(d);
+              SDL_Log("ls %s: %s", dir, list.c_str());
+          }
+          #endif
+          """
+              new = helper + old + """#if defined(RA_IOS_LEGACY)
               /* iOS 7 build: look for assets/cnc/gdi/INSTALL/CONQUER.INI in every place the data can plausibly be.
                * Jailbreak (.deb / ldid) builds run unsandboxed as mobile, so HOME is /var/mobile and iTunes
                * file sharing is NOT the folder in use: Documents is then /var/mobile/Documents. */
@@ -901,13 +930,34 @@ jobs:
                           return;
                       }
                   }
-                  SDL_Log("data root: nothing found in %d candidate folders", (int)roots.size());
+                  SDL_Log("data root: nothing found in %d candidate folders; searching for CONQUER.INI", (int)roots.size());
+                  log_dir("/var/mobile/Documents");
+                  log_dir("/var/mobile/Media");
+                  static char const *const search[] = { "/var/mobile/Documents", "/var/mobile/Media", "/var/mobile/Applications",
+                      "/var/mobile/Containers/Data/Application", "/private/var/mobile/Documents", 0 };
+                  for (int k = 0; search[k]; ++k) {
+                      std::string hit;
+                      if (!find_file_rec(search[k], "CONQUER.INI", 7, hit)) continue;
+                      SDL_Log("found CONQUER.INI at %s", hit.c_str());
+                      std::string install = parent_path(hit);
+                      std::string gdi = parent_path(install);
+                      std::string auto_root = "/var/mobile/Documents/cnc-auto";
+                      make_directories(join_path(auto_root, "assets/cnc"));
+                      std::string link = join_path(auto_root, "assets/cnc/gdi");
+                      unlink(link.c_str());
+                      if (symlink(gdi.c_str(), link.c_str()) == 0 && use_resource_root(auto_root)) {
+                          SDL_Log("using %s -> %s", link.c_str(), gdi.c_str());
+                          return;
+                      }
+                      SDL_Log("could not use %s (errno=%d)", gdi.c_str(), errno);
+                  }
+                  SDL_Log("CONQUER.INI was not found anywhere: copy the data so that this exists: /var/mobile/Documents/assets/cnc/gdi/INSTALL/CONQUER.INI");
               }
           #endif
           """
               assert old in t
               t = t.replace(old, new, 1)
-              t = t.replace("#include <limits.h>\n", "#include <limits.h>\n#include <stdlib.h>\n#include <vector>\n", 1)
+              t = t.replace("#include <limits.h>\n", "#include <limits.h>\n#include <stdlib.h>\n#include <strings.h>\n#include <vector>\n", 1)
               open(p, "w").write(t)
           print("ios_main.cpp patched")
           EOF_PY
