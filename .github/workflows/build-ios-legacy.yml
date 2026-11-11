@@ -860,7 +860,13 @@ jobs:
           		"assets/cnc/gdi/MOVIES.MIX", "assets/cnc/gdi/TRANSIT.MIX", "assets/cnc/gdi/SPEECH.MIX", 0 };
           	for (int i = 0; files[i]; ++i) {
           		struct stat info;
-          		if (stat(files[i], &info) == 0) SDL_Log("audit: %-40s %lld bytes", files[i], (long long)info.st_size);
+          		if (stat(files[i], &info) == 0) {
+          			int fd = open(files[i], O_RDONLY);
+          			int oerr = errno;
+          			if (fd >= 0) close(fd);
+          			SDL_Log("audit: %-40s %lld bytes mode=%o uid=%d %s", files[i], (long long)info.st_size, (unsigned)info.st_mode, (int)info.st_uid,
+          				fd >= 0 ? "readable" : strerror(oerr));
+          		}
           		else SDL_Log("audit: %-40s MISSING (errno=%d)", files[i], errno);
           	}
           	static char const *const dirs[] = { "assets", "assets/cnc", "assets/cnc/gdi", "assets/cnc/gdi/INSTALL", 0 };
@@ -1034,6 +1040,207 @@ jobs:
           edit("CODE/MIXFILE.CPP", mixfile)
           edit("CODE/CDFILE.CPP", cdfile)
           EOF_FILE_14
+          cat > ios-legacy/scripts/patch_fixes.py <<'EOF_FILE_15'
+          #!/usr/bin/env python3
+          """Runtime fixes for the iOS legacy port (idempotent, run from the repo root):
+            * CCLOCAL.MIX / unreadable data: self-heal EACCES (chmod if we own the file), log the real errno,
+              flush stderr before exit() so the last error line reaches cnc_ios.log
+            * on-screen keyboard: toggle button (top-left) + SDL text input -> key presses,
+              keyboard pops up automatically for the hall-of-fame name entry (needed to continue after a mission)"""
+
+          def edit(path, fn, enc):
+              raw = open(path, "rb").read()
+              t = raw.decode(enc)
+              new = fn(t)
+              if new != t:
+                  open(path, "wb").write(new.encode(enc))
+                  print("fixes patch:", path)
+              else:
+                  print("fixes patch (nothing to do):", path)
+
+          def nl(t):
+              return "\r\n" if "\r\n" in t else "\n"
+
+          def rawfile(t):
+              if "let the stderr capture thread drain" in t:
+                  return t
+              E = nl(t)
+              a = "\tfprintf(stderr, \"File error%s%s%s: %s\\n\", filename ? \" (\" : \"\", filename ? filename : \"\", filename ? \")\" : \"\", strerror(error));" + E + "\texit(EXIT_FAILURE);"
+              assert a in t, "RawFileClass::Error anchor not found"
+              t = t.replace(a, a.replace("\texit(", "\tfflush(stderr);" + E + "\tusleep(200000);\t/* let the stderr capture thread drain before atexit */" + E + "\texit("), 1)
+              b = "\t\tif (open_failed && errno == ENOENT) {" + E + "\t\t\treturn(false);" + E + "\t\t}"
+              assert b in t, "RawFileClass::Is_Available anchor not found"
+              t = t.replace(b, "\t\tif (open_failed) {" + E + "\t\t\tint saved = errno;" + E + "\t\t\tif (saved != ENOENT) fprintf(stderr, \"file: Is_Available open('%s') failed errno=%d (%s)\\n\", Filename, saved, strerror(saved));" + E + "\t\t\terrno = saved;" + E + "\t\t}" + E + b, 1)
+              inc = "#include\t<stdio.h>"
+              assert inc in t, "RAWFILE include anchor not found"
+              t = t.replace(inc, inc + E + "#include\t<unistd.h>" + E + "#include\t<errno.h>", 1)
+              return t
+
+          def dos_compat(t):
+              if "no read access to" in t:
+                  return t
+              a = "\tint fd = open(path, mode, S_IREAD | S_IWRITE);\n\tif (handle) {\n\t\t*handle = fd;"
+              assert a in t, "_dos_open anchor not found"
+              n = ("\tint fd = open(path, mode, S_IREAD | S_IWRITE);\n"
+                   "\tif (fd == -1 && errno == EACCES && (mode & (O_WRONLY | O_RDWR | O_CREAT)) == 0) {\n"
+                   "\t\t/* data copied over ssh/scp is often root:wheel 0600; if we own it, make it readable and retry */\n"
+                   "\t\tstruct stat st;\n"
+                   "\t\tmemset(&st, 0, sizeof(st));\n"
+                   "\t\tif (stat(path, &st) == 0 && st.st_uid == geteuid() && chmod(path, st.st_mode | S_IRUSR | S_IRGRP | S_IROTH) == 0) {\n"
+                   "\t\t\tfd = open(path, mode, S_IREAD | S_IWRITE);\n"
+                   "\t\t}\n"
+                   "\t\tif (fd == -1) {\n"
+                   "\t\t\tint saved = errno;\n"
+                   "\t\t\tfprintf(stderr, \"file: no read access to '%s' (uid=%d owner=%d mode=%o). Fix: chmod -R a+rX /var/mobile/Documents/assets && chown -R mobile /var/mobile/Documents/assets\\n\", path, (int)geteuid(), (int)st.st_uid, (unsigned)st.st_mode);\n"
+                   "\t\t\terrno = saved;\n"
+                   "\t\t}\n"
+                   "\t}\n"
+                   "\tif (handle) {\n\t\t*handle = fd;")
+              t = t.replace(a, n, 1)
+              inc = "#include <dirent.h>"
+              assert inc in t, "dos_compat include anchor not found"
+              t = t.replace(inc, inc + "\n#include <errno.h>\n#include <fcntl.h>\n#include <stdio.h>\n#include <string.h>", 1)
+              return t
+
+          KBD_HELPERS = r'''
+          /* ---- on-screen keyboard toggle (iOS soft keyboard via SDL text input) ---- */
+          static long long MobileKbdFinger = -1;
+
+          static void mobile_kbd_button_rect(int out_w, int out_h, SDL_Rect *r)
+          {
+          	int s = out_h / 12;
+          	if (s < 40) s = 40;
+          	if (s > 110) s = 110;
+          	r->x = s / 4;
+          	r->y = s / 4;
+          	r->w = s * 3 / 2;
+          	r->h = s;
+          }
+
+          static bool mobile_kbd_hit(float nx, float ny)
+          {
+          	if (!MacRenderer) return false;
+          	int ow = 0, oh = 0;
+          	SDL_GetRendererOutputSize(MacRenderer, &ow, &oh);
+          	if (ow <= 0 || oh <= 0) return false;
+          	SDL_Rect r;
+          	mobile_kbd_button_rect(ow, oh, &r);
+          	int px = (int)(nx * (float)ow);
+          	int py = (int)(ny * (float)oh);
+          	int pad = r.h / 4;	/* generous touch target */
+          	return px >= r.x - pad && px < r.x + r.w + pad && py >= r.y - pad && py < r.y + r.h + pad;
+          }
+
+          static void mobile_kbd_toggle(void)
+          {
+          	if (SDL_IsTextInputActive()) {
+          		SDL_StopTextInput();
+          	} else {
+          		SDL_StartTextInput();
+          	}
+          	SDL_Log("mobile: on-screen keyboard %s", SDL_IsTextInputActive() ? "ON" : "OFF");
+          }
+
+          static void mobile_kbd_draw(void)
+          {
+          	if (!MacRenderer) return;
+          	int ow = 0, oh = 0;
+          	SDL_GetRendererOutputSize(MacRenderer, &ow, &oh);
+          	SDL_Rect r;
+          	mobile_kbd_button_rect(ow, oh, &r);
+          	bool on = SDL_IsTextInputActive() != SDL_FALSE;
+          	SDL_SetRenderDrawBlendMode(MacRenderer, SDL_BLENDMODE_BLEND);
+          	SDL_SetRenderDrawColor(MacRenderer, 0, 0, 0, 150);
+          	SDL_RenderFillRect(MacRenderer, &r);
+          	if (on) SDL_SetRenderDrawColor(MacRenderer, 80, 255, 80, 230);
+          	else SDL_SetRenderDrawColor(MacRenderer, 200, 200, 200, 200);
+          	SDL_RenderDrawRect(MacRenderer, &r);
+          	/* keyboard glyph: 3 rows of keys + space bar */
+          	int pad = r.h / 6;
+          	int kw = (r.w - pad * 2) / 7;
+          	int kh = (r.h - pad * 2) / 5;
+          	if (kw < 2) kw = 2;
+          	if (kh < 2) kh = 2;
+          	for (int row = 0; row < 3; ++row) {
+          		for (int col = 0; col < 6; ++col) {
+          			SDL_Rect k = { r.x + pad + col * (kw + 1) + (row == 1 ? kw / 2 : 0), r.y + pad + row * (kh + 1), kw - 1, kh - 1 };
+          			SDL_RenderFillRect(MacRenderer, &k);
+          		}
+          	}
+          	SDL_Rect sp = { r.x + pad + kw * 2, r.y + pad + 3 * (kh + 1), kw * 3, kh - 1 };
+          	SDL_RenderFillRect(MacRenderer, &sp);
+          	if (!on) {
+          		SDL_SetRenderDrawColor(MacRenderer, 255, 80, 80, 230);
+          		SDL_RenderDrawLine(MacRenderer, r.x + 2, r.y + r.h - 2, r.x + r.w - 2, r.y + 2);
+          	}
+          	SDL_SetRenderDrawBlendMode(MacRenderer, SDL_BLENDMODE_NONE);
+          }
+
+          /* Exported so game code (hall-of-fame name entry) can pop the keyboard up by itself. */
+          extern "C++" void MacSDL_SetTextInput(int enabled)
+          {
+          	if (enabled && !SDL_IsTextInputActive()) SDL_StartTextInput();
+          	else if (!enabled && SDL_IsTextInputActive()) SDL_StopTextInput();
+          }
+          '''
+
+          def sdl_runtime(t):
+              if "mobile_kbd_toggle" in t:
+                  return t
+              a = "static int MobilePointerDragStartY = 0;\n#endif\n"
+              assert a in t, "MobilePointerDragStartY anchor not found"
+              t = t.replace(a, a[:-len("#endif\n")] + KBD_HELPERS + "#endif\n", 1)
+
+              def rep(old, new, what):
+                  nonlocal t
+                  assert old in t, what + " anchor not found"
+                  t = t.replace(old, new, 1)
+
+              rep("\t\t\tcase SDL_FINGERDOWN: {\n\t\t\t\tint x = 0;\n\t\t\t\tint y = 0;\n",
+                  "\t\t\tcase SDL_FINGERDOWN: {\n\t\t\t\tint x = 0;\n\t\t\t\tint y = 0;\n"
+                  "\t\t\t\tif (MobileKbdFinger < 0 && mobile_kbd_hit(event.tfinger.x, event.tfinger.y)) {\n"
+                  "\t\t\t\t\tMobileKbdFinger = (long long)event.tfinger.fingerId;\n"
+                  "\t\t\t\t\tmobile_kbd_toggle();\n\t\t\t\t\tbreak;\n\t\t\t\t}\n", "SDL_FINGERDOWN")
+              rep("\t\t\tcase SDL_FINGERMOTION: {\n\t\t\t\tint x = 0;\n\t\t\t\tint y = 0;\n",
+                  "\t\t\tcase SDL_FINGERMOTION: {\n\t\t\t\tint x = 0;\n\t\t\t\tint y = 0;\n"
+                  "\t\t\t\tif (MobileKbdFinger == (long long)event.tfinger.fingerId) {\n\t\t\t\t\tbreak;\n\t\t\t\t}\n", "SDL_FINGERMOTION")
+              rep("\t\t\tcase SDL_FINGERUP: {\n\t\t\t\tint x = 0;\n\t\t\t\tint y = 0;\n",
+                  "\t\t\tcase SDL_FINGERUP: {\n\t\t\t\tint x = 0;\n\t\t\t\tint y = 0;\n"
+                  "\t\t\t\tif (MobileKbdFinger == (long long)event.tfinger.fingerId) {\n"
+                  "\t\t\t\t\tMobileKbdFinger = -1;\n\t\t\t\t\tbreak;\n\t\t\t\t}\n", "SDL_FINGERUP")
+              rep("\t\t\tcase SDL_KEYDOWN:\n\t\t\tcase SDL_KEYUP: {\n",
+                  "#if defined(RA_MOBILE_TOUCH)\n"
+                  "\t\t\tcase SDL_TEXTINPUT: {\n"
+                  "\t\t\t\tfor (char const *c = event.text.text; *c; ++c) {\n"
+                  "\t\t\t\t\tunsigned char ch = (unsigned char)*c;\n"
+                  "\t\t\t\t\tint vk = 0;\n"
+                  "\t\t\t\t\tif (ch >= 'a' && ch <= 'z') vk = 'A' + (ch - 'a');\n"
+                  "\t\t\t\t\telse if ((ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) vk = ch;\n"
+                  "\t\t\t\t\telse if (ch == ' ') vk = VK_SPACE;\n"
+                  "\t\t\t\t\tif (vk) mac_queue_unmodified_key_pulse(vk);\n"
+                  "\t\t\t\t}\n\t\t\t\tbreak;\n\t\t\t}\n#endif\n\n"
+                  "\t\t\tcase SDL_KEYDOWN:\n\t\t\tcase SDL_KEYUP: {\n", "SDL_KEYDOWN")
+              rep("\tSDL_RenderCopy(MacRenderer, MacTexture, 0, &destination);\n\tSDL_RenderPresent(MacRenderer);",
+                  "\tSDL_RenderCopy(MacRenderer, MacTexture, 0, &destination);\n#if defined(RA_MOBILE_TOUCH)\n\tmobile_kbd_draw();\n#endif\n\tSDL_RenderPresent(MacRenderer);", "present")
+              return t
+
+          def score(t):
+              if "MacSDL_SetTextInput" in t:
+                  return t
+              E = nl(t)
+              old = "\tint key, ascii, index=0;" + E
+              assert old in t, "Input_Name anchor not found"
+              t = t.replace(old, old + "#if defined(RA_MOBILE_TOUCH)" + E + "\textern void MacSDL_SetTextInput(int);" + E + "\tMacSDL_SetTextInput(1);" + E + "#endif" + E, 1)
+              old = "\t} while(key!=KA_RETURN);"
+              assert old in t, "Input_Name loop end anchor not found"
+              t = t.replace(old, old + E + "#if defined(RA_MOBILE_TOUCH)" + E + "\tMacSDL_SetTextInput(0);" + E + "#endif", 1)
+              return t
+
+          edit("CODE/RAWFILE.CPP", rawfile, "latin-1")
+          edit("PORT/MAC/src/dos_compat.cpp", dos_compat, "utf-8")
+          edit("PORT/MAC/src/mac_sdl_runtime.cpp", sdl_runtime, "utf-8")
+          edit("CODE/SCORE.CPP", score, "latin-1")
+          EOF_FILE_15
           chmod +x ios-legacy/scripts/*.sh ios-legacy/scripts/*.py
           python3 -I ios-legacy/scripts/gen_resources.py ios-legacy/resources
           python3 - <<'EOF_PY'
@@ -1175,6 +1382,7 @@ jobs:
           EOF_PY
           python3 -I ios-legacy/scripts/patch_ios_main_log.py
           python3 -I ios-legacy/scripts/patch_trace.py
+          python3 -I ios-legacy/scripts/patch_fixes.py
 
       - name: Theos + toolchain + iPhoneOS 9.3 SDK
         run: |
